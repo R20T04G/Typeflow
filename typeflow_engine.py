@@ -410,7 +410,8 @@ def _check_transition_ahead(text: str, pos: int) -> bool:
 
 
 def type_text(text: str, profile: TypingProfile,
-              on_progress=None, should_stop=None):
+              on_progress=None, should_stop=None, check_pause=None,
+              get_resume_index=None, start_index=0):
     """
     Simulate human typing with research-backed patterns.
 
@@ -423,10 +424,23 @@ def type_text(text: str, profile: TypingProfile,
     burst_counter = random.randint(*profile.burst_length)
     start_time = time.time()
 
-    i = 0
+    i = max(0, min(int(start_index), total_chars))
     while i < total_chars:
         if should_stop and should_stop():
             return chars_typed, time.time() - start_time
+
+        if check_pause:
+            while check_pause():
+                if get_resume_index:
+                    try:
+                        requested = int(get_resume_index())
+                        i = max(0, min(requested, total_chars))
+                    except (TypeError, ValueError):
+                        pass
+                time.sleep(0.1)
+                if should_stop and should_stop():
+                    return chars_typed, time.time() - start_time
+
 
         ch = text[i]
         current_word = _find_current_word(text, i)
