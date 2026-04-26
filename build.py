@@ -16,7 +16,10 @@ def main():
         "--windowed",
         "--name", "Typeflow",
         "--add-data", "typeflow_engine.py;.",
+        "--add-data", "ai_cleanup.py;.",
         "--hidden-import", "customtkinter",
+        "--hidden-import", "docx",
+        "--hidden-import", "fitz",
         "--collect-all", "customtkinter",
         "typeflow_gui.py",
     ]

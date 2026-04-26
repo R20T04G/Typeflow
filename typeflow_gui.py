@@ -1,9 +1,8 @@
 """
-Typeflow GUI — A modern desktop app for human-like typing simulation.
-Built with customtkinter for a polished, dark-mode interface.
+Typeflow GUI v2 — Simplified interface with advanced options toggle.
 
-Run:  python typeflow_gui.py
-Build: pyinstaller --onefile --windowed --name Typeflow typeflow_gui.py
+Default view: text input + desired time slider + start/stop.
+Advanced: all parameter sliders exposed.
 """
 
 import os
@@ -11,9 +10,9 @@ import sys
 import threading
 import tkinter as tk
 from tkinter import filedialog
+
 import customtkinter as ctk
 
-# Ensure the engine module can be found when running as a PyInstaller bundle
 if getattr(sys, 'frozen', False):
     _base = sys._MEIPASS
 else:
@@ -24,6 +23,34 @@ from typeflow_engine import (
     TypingProfile, estimate_time, format_duration, type_text,
     compute_minimum_time, solve_profile_for_time,
 )
+from ai_cleanup import scan as ai_scan, clean as ai_clean
+
+# ---------------------------------------------------------------------------
+# File loaders
+# ---------------------------------------------------------------------------
+def load_docx(path: str) -> str:
+    from docx import Document
+    doc = Document(path)
+    return '\n'.join(p.text for p in doc.paragraphs)
+
+def load_pdf(path: str) -> str:
+    import fitz
+    doc = fitz.open(path)
+    parts = []
+    for page in doc:
+        parts.append(page.get_text())
+    doc.close()
+    return '\n'.join(parts)
+
+def load_text_file(path: str) -> str:
+    ext = os.path.splitext(path)[1].lower()
+    if ext == '.docx':
+        return load_docx(path)
+    elif ext == '.pdf':
+        return load_pdf(path)
+    else:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            return f.read()
 
 # ---------------------------------------------------------------------------
 # Theme
@@ -31,613 +58,572 @@ from typeflow_engine import (
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-FONT_FAMILY = "Segoe UI"
-COLOR_BG = "#0f0f14"
-COLOR_CARD = "#1a1a24"
-COLOR_CARD_HOVER = "#22222e"
-COLOR_ACCENT = "#6c5ce7"
-COLOR_ACCENT_HOVER = "#7e6ff0"
-COLOR_RED = "#e74c3c"
-COLOR_RED_HOVER = "#ff6b5a"
-COLOR_GREEN = "#00b894"
-COLOR_YELLOW = "#f0c040"
-COLOR_TEXT = "#e8e8f0"
-COLOR_TEXT_DIM = "#8888a0"
-COLOR_BORDER = "#2a2a3a"
-COLOR_INPUT_BG = "#12121c"
+FONT = "Segoe UI"
+BG = "#0f0f14"
+CARD = "#1a1a24"
+ACCENT = "#6c5ce7"
+ACCENT_H = "#7e6ff0"
+RED = "#e74c3c"
+RED_H = "#ff6b5a"
+GREEN = "#00b894"
+YELLOW = "#f0c040"
+TEXT = "#e8e8f0"
+DIM = "#8888a0"
+BORDER = "#2a2a3a"
+INPUT = "#12121c"
 
 
 class TypeflowApp(ctk.CTk):
-    """Main application window."""
 
     def __init__(self):
         super().__init__()
-
         self.title("Typeflow")
-        self.geometry("960x700")
-        self.minsize(860, 620)
-        self.configure(fg_color=COLOR_BG)
+        self.geometry("940x680")
+        self.minsize(800, 560)
+        self.configure(fg_color=BG)
 
-        self._typing_thread = None
         self._stop_flag = False
         self._is_running = False
-        self._auto_mode = True           # True = desired-time drives sliders
-        self._suppressing_trace = False  # prevent recursive slider updates
-        self._default_est_seconds = 0.0  # estimate with default profile
-        self._min_time_seconds = 0.0     # absolute floor
+        self._suppress = False
+        self._auto_mode = True
+        self._default_est = 0.0
+        self._min_time = 0.0
+        self._typing_thread = None
+        self._slider_labels = {}  # id(var) -> (label_widget, suffix)
+        self._refresh_timer = None  # debounce timer id
 
-        self._build_ui()
+        self._build()
 
-    # ------------------------------------------------------------------
-    # UI Construction
-    # ------------------------------------------------------------------
-    def _build_ui(self):
+    # ==================================================================
+    # BUILD UI
+    # ==================================================================
+    def _build(self):
         # --- Top bar ---
-        top = ctk.CTkFrame(self, fg_color=COLOR_CARD, corner_radius=0, height=56)
+        top = ctk.CTkFrame(self, fg_color=CARD, corner_radius=0, height=50)
         top.pack(fill="x")
         top.pack_propagate(False)
+        ctk.CTkLabel(top, text="TYPEFLOW", font=(FONT, 18, "bold"),
+                     text_color=ACCENT).pack(side="left", padx=16)
+        ctk.CTkLabel(top, text="Human-like typing simulator",
+                     font=(FONT, 11), text_color=DIM).pack(side="left")
+        ctk.CTkLabel(top, text="Mouse to top-left corner = ABORT",
+                     font=(FONT, 10), text_color=RED).pack(side="right", padx=16)
 
-        ctk.CTkLabel(
-            top, text="TYPEFLOW",
-            font=(FONT_FAMILY, 20, "bold"), text_color=COLOR_ACCENT,
-        ).pack(side="left", padx=20)
-
-        ctk.CTkLabel(
-            top, text="Human-like typing simulator",
-            font=(FONT_FAMILY, 12), text_color=COLOR_TEXT_DIM,
-        ).pack(side="left", padx=(0, 20))
-
-        safety_label = ctk.CTkLabel(
-            top,
-            text="Move mouse to top-left corner to ABORT",
-            font=(FONT_FAMILY, 11), text_color=COLOR_RED,
-        )
-        safety_label.pack(side="right", padx=20)
-
-        # --- Main content: two columns ---
+        # --- Body: two columns ---
         body = ctk.CTkFrame(self, fg_color="transparent")
-        body.pack(fill="both", expand=True, padx=16, pady=(12, 8))
+        body.pack(fill="both", expand=True, padx=12, pady=(8, 4))
         body.grid_columnconfigure(0, weight=3)
         body.grid_columnconfigure(1, weight=2)
         body.grid_rowconfigure(0, weight=1)
 
-        # ====== LEFT COLUMN — Text input ======
-        left = ctk.CTkFrame(body, fg_color=COLOR_CARD, corner_radius=12,
-                            border_width=1, border_color=COLOR_BORDER)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        # ========== LEFT: Text input ==========
+        left = ctk.CTkFrame(body, fg_color=CARD, corner_radius=12,
+                            border_width=1, border_color=BORDER)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
 
-        left_header = ctk.CTkFrame(left, fg_color="transparent")
-        left_header.pack(fill="x", padx=16, pady=(14, 4))
+        hdr = ctk.CTkFrame(left, fg_color="transparent")
+        hdr.pack(fill="x", padx=14, pady=(12, 4))
+        ctk.CTkLabel(hdr, text="Text to Type", font=(FONT, 13, "bold"),
+                     text_color=TEXT).pack(side="left")
 
-        ctk.CTkLabel(
-            left_header, text="Text to Type",
-            font=(FONT_FAMILY, 14, "bold"), text_color=COLOR_TEXT,
-        ).pack(side="left")
+        btns = ctk.CTkFrame(hdr, fg_color="transparent")
+        btns.pack(side="right")
+        for label, cmd in [("Load File", self._load_file),
+                           ("Paste", self._paste), ("Clear", self._clear)]:
+            ctk.CTkButton(btns, text=label, width=75, height=28,
+                          font=(FONT, 11), corner_radius=6,
+                          fg_color=BORDER, hover_color="#2e2e3e",
+                          command=cmd).pack(side="left", padx=2)
 
-        btn_frame = ctk.CTkFrame(left_header, fg_color="transparent")
-        btn_frame.pack(side="right")
+        self.text_box = ctk.CTkTextbox(left, font=(FONT, 12), corner_radius=8,
+                                       fg_color=INPUT, text_color=TEXT,
+                                       border_width=1, border_color=BORDER,
+                                       wrap="word")
+        self.text_box.pack(fill="both", expand=True, padx=14, pady=(4, 6))
+        self.text_box.bind("<KeyRelease>", lambda e: self._debounced_refresh())
 
-        ctk.CTkButton(
-            btn_frame, text="Load File", width=90, height=30,
-            font=(FONT_FAMILY, 12), corner_radius=8,
-            fg_color=COLOR_BORDER, hover_color=COLOR_CARD_HOVER,
-            command=self._load_file,
-        ).pack(side="left", padx=(0, 6))
+        # AI cleanup bar (hidden by default)
+        self.ai_bar = ctk.CTkFrame(left, fg_color="#1e1428", corner_radius=8,
+                                   border_width=1, border_color="#3a2a5a")
+        # Not packed yet — shown only when artifacts detected
+        self.ai_label = ctk.CTkLabel(self.ai_bar, text="", font=(FONT, 11),
+                                     text_color=YELLOW)
+        self.ai_label.pack(side="left", padx=12, pady=6)
+        ctk.CTkButton(self.ai_bar, text="Clean", width=60, height=26,
+                      font=(FONT, 11), corner_radius=6,
+                      fg_color=ACCENT, hover_color=ACCENT_H,
+                      command=self._do_ai_cleanup).pack(side="right", padx=12, pady=6)
 
-        ctk.CTkButton(
-            btn_frame, text="Paste", width=70, height=30,
-            font=(FONT_FAMILY, 12), corner_radius=8,
-            fg_color=COLOR_BORDER, hover_color=COLOR_CARD_HOVER,
-            command=self._paste_clipboard,
-        ).pack(side="left", padx=(0, 6))
+        # ========== RIGHT: Controls ==========
+        right = ctk.CTkScrollableFrame(body, fg_color=CARD, corner_radius=12,
+                                       border_width=1, border_color=BORDER,
+                                       scrollbar_button_color=BORDER,
+                                       scrollbar_button_hover_color=ACCENT)
+        right.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
 
-        ctk.CTkButton(
-            btn_frame, text="Clear", width=60, height=30,
-            font=(FONT_FAMILY, 12), corner_radius=8,
-            fg_color=COLOR_BORDER, hover_color=COLOR_CARD_HOVER,
-            command=self._clear_text,
-        ).pack(side="left")
+        # --- Stats ---
+        ctk.CTkLabel(right, text="Summary", font=(FONT, 13, "bold"),
+                     text_color=TEXT).pack(anchor="w", padx=14, pady=(12, 6))
+        sf = ctk.CTkFrame(right, fg_color=INPUT, corner_radius=8,
+                          border_width=1, border_color=BORDER)
+        sf.pack(fill="x", padx=14, pady=(0, 8))
+        self.stat_chars = self._stat(sf, "Characters", "0")
+        self.stat_words = self._stat(sf, "Words", "0")
+        self.stat_est = self._stat(sf, "Est. Time", "--")
 
-        self.text_box = ctk.CTkTextbox(
-            left, font=(FONT_FAMILY, 13), corner_radius=8,
-            fg_color=COLOR_INPUT_BG, text_color=COLOR_TEXT,
-            border_width=1, border_color=COLOR_BORDER,
-            wrap="word",
-        )
-        self.text_box.pack(fill="both", expand=True, padx=16, pady=(6, 14))
-        self.text_box.bind("<KeyRelease>", lambda e: self._update_stats())
+        # --- Desired time ---
+        ctk.CTkFrame(right, fg_color=BORDER, height=1).pack(fill="x", padx=14, pady=6)
+        ctk.CTkLabel(right, text="Desired Time", font=(FONT, 13, "bold"),
+                     text_color=TEXT).pack(anchor="w", padx=14, pady=(4, 2))
+        ctk.CTkLabel(right, text="Drag to choose how long the typing takes",
+                     font=(FONT, 10), text_color=DIM).pack(anchor="w", padx=14)
 
-        # ====== RIGHT COLUMN — Settings ======
-        right = ctk.CTkScrollableFrame(
-            body, fg_color=COLOR_CARD, corner_radius=12,
-            border_width=1, border_color=COLOR_BORDER,
-            scrollbar_button_color=COLOR_BORDER,
-            scrollbar_button_hover_color=COLOR_ACCENT,
-        )
-        right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
-
-        ctk.CTkLabel(
-            right, text="Settings",
-            font=(FONT_FAMILY, 14, "bold"), text_color=COLOR_TEXT,
-        ).pack(anchor="w", padx=16, pady=(14, 10))
-
-        # -- Sliders --
-        self.speed_var = tk.DoubleVar(value=1.0)
-        self._make_slider(right, "Speed Multiplier", self.speed_var,
-                          0.3, 3.0, "x", resolution=0.1)
-
-        self.wpm_var = tk.DoubleVar(value=55.0)
-        self._make_slider(right, "Base WPM", self.wpm_var,
-                          20, 120, "wpm", resolution=5)
-
-        self.error_var = tk.DoubleVar(value=1.2)
-        self._make_slider(right, "Typo Rate", self.error_var,
-                          0.0, 8.0, "%", resolution=0.1)
-
-        self.thinking_var = tk.DoubleVar(value=0.8)
-        self._make_slider(right, "Thinking Pauses", self.thinking_var,
-                          0.0, 5.0, "%", resolution=0.1)
-
-        self.distraction_var = tk.DoubleVar(value=0.1)
-        self._make_slider(right, "Distraction Breaks", self.distraction_var,
-                          0.0, 2.0, "%", resolution=0.05)
-
-        self.save_var = tk.IntVar(value=300)
-        self._make_slider(right, "Save Pause Interval", self.save_var,
-                          50, 1000, "chars", resolution=50)
-
-        self.countdown_var = tk.IntVar(value=5)
-        self._make_slider(right, "Countdown", self.countdown_var,
-                          3, 15, "sec", resolution=1)
-
-        # -- Separator --
-        sep = ctk.CTkFrame(right, fg_color=COLOR_BORDER, height=1)
-        sep.pack(fill="x", padx=16, pady=(12, 8))
-
-        # -- Stats panel --
-        ctk.CTkLabel(
-            right, text="Estimation",
-            font=(FONT_FAMILY, 14, "bold"), text_color=COLOR_TEXT,
-        ).pack(anchor="w", padx=16, pady=(4, 6))
-
-        stats_frame = ctk.CTkFrame(right, fg_color=COLOR_INPUT_BG,
-                                   corner_radius=8, border_width=1,
-                                   border_color=COLOR_BORDER)
-        stats_frame.pack(fill="x", padx=16, pady=(0, 10))
-
-        self.stat_chars = self._make_stat_row(stats_frame, "Characters", "0")
-        self.stat_words = self._make_stat_row(stats_frame, "Words", "0")
-        self.stat_sentences = self._make_stat_row(stats_frame, "Sentences", "0")
-        self.stat_est = self._make_stat_row(stats_frame, "Est. Time", "--")
-
-        # -- Separator --
-        ctk.CTkFrame(right, fg_color=COLOR_BORDER, height=1).pack(
-            fill="x", padx=16, pady=(4, 8))
-
-        # ====== DESIRED TIME CONTROL ======
-        ctk.CTkLabel(
-            right, text="Desired Time",
-            font=(FONT_FAMILY, 14, "bold"), text_color=COLOR_TEXT,
-        ).pack(anchor="w", padx=16, pady=(4, 2))
-
-        ctk.CTkLabel(
-            right, text="Set a target and parameters auto-adjust",
-            font=(FONT_FAMILY, 10), text_color=COLOR_TEXT_DIM,
-        ).pack(anchor="w", padx=16, pady=(0, 6))
-
-        # Mode toggle
-        mode_frame = ctk.CTkFrame(right, fg_color="transparent")
-        mode_frame.pack(fill="x", padx=16, pady=(0, 6))
-        self.mode_var = tk.StringVar(value="auto")
-        ctk.CTkRadioButton(
-            mode_frame, text="Auto (time-driven)", variable=self.mode_var,
-            value="auto", font=(FONT_FAMILY, 11), text_color=COLOR_TEXT_DIM,
-            fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER,
-            command=self._on_mode_change,
-        ).pack(side="left", padx=(0, 12))
-        ctk.CTkRadioButton(
-            mode_frame, text="Manual", variable=self.mode_var,
-            value="manual", font=(FONT_FAMILY, 11), text_color=COLOR_TEXT_DIM,
-            fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER,
-            command=self._on_mode_change,
-        ).pack(side="left")
-
-        # Desired-time slider
-        self.desired_time_var = tk.DoubleVar(value=0.0)
-        dt_frame = ctk.CTkFrame(right, fg_color="transparent")
-        dt_frame.pack(fill="x", padx=16, pady=(0, 4))
-        dt_top = ctk.CTkFrame(dt_frame, fg_color="transparent")
-        dt_top.pack(fill="x")
-        ctk.CTkLabel(dt_top, text="Target",
-                     font=(FONT_FAMILY, 12), text_color=COLOR_TEXT_DIM
-                     ).pack(side="left")
-        self.desired_time_label = ctk.CTkLabel(
-            dt_top, text="--",
-            font=(FONT_FAMILY, 12, "bold"), text_color=COLOR_TEXT)
-        self.desired_time_label.pack(side="right")
+        self.desired_var = tk.DoubleVar(value=0)
+        dt = ctk.CTkFrame(right, fg_color="transparent")
+        dt.pack(fill="x", padx=14, pady=(6, 2))
+        ctk.CTkLabel(dt, text="Target", font=(FONT, 11),
+                     text_color=DIM).pack(side="left")
+        self.desired_label = ctk.CTkLabel(dt, text="--", font=(FONT, 11, "bold"),
+                                          text_color=TEXT)
+        self.desired_label.pack(side="right")
 
         self.desired_slider = ctk.CTkSlider(
-            dt_frame, from_=0, to=600, variable=self.desired_time_var,
-            width=200, height=16, corner_radius=8,
-            fg_color=COLOR_INPUT_BG, progress_color=COLOR_GREEN,
-            button_color=COLOR_GREEN, button_hover_color=COLOR_ACCENT_HOVER,
-        )
-        self.desired_slider.pack(fill="x", pady=(2, 0))
-        self.desired_time_var.trace_add("write", self._on_desired_time_slider)
+            right, from_=0, to=600, variable=self.desired_var,
+            height=14, corner_radius=7, fg_color=INPUT,
+            progress_color=GREEN, button_color=GREEN,
+            button_hover_color=ACCENT_H)
+        self.desired_slider.pack(fill="x", padx=14, pady=(0, 2))
+        self.desired_var.trace_add("write", self._on_desired_change)
 
-        # Custom entry row
-        custom_frame = ctk.CTkFrame(right, fg_color="transparent")
-        custom_frame.pack(fill="x", padx=16, pady=(4, 4))
-        ctk.CTkLabel(custom_frame, text="Custom (min):",
-                     font=(FONT_FAMILY, 11), text_color=COLOR_TEXT_DIM
-                     ).pack(side="left")
-        self.custom_time_entry = ctk.CTkEntry(
-            custom_frame, width=70, height=28, font=(FONT_FAMILY, 12),
-            fg_color=COLOR_INPUT_BG, text_color=COLOR_TEXT,
-            border_color=COLOR_BORDER, corner_radius=6,
-            placeholder_text="min")
-        self.custom_time_entry.pack(side="left", padx=(6, 6))
-        ctk.CTkButton(
-            custom_frame, text="Set", width=50, height=28,
-            font=(FONT_FAMILY, 11), corner_radius=6,
-            fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER,
-            command=self._on_custom_time_set,
-        ).pack(side="left")
+        # Custom time entry
+        cf = ctk.CTkFrame(right, fg_color="transparent")
+        cf.pack(fill="x", padx=14, pady=(2, 6))
+        ctk.CTkLabel(cf, text="Custom (min):", font=(FONT, 10),
+                     text_color=DIM).pack(side="left")
+        self.custom_entry = ctk.CTkEntry(cf, width=65, height=26,
+                                         font=(FONT, 11), fg_color=INPUT,
+                                         text_color=TEXT, border_color=BORDER,
+                                         corner_radius=5, placeholder_text="min")
+        self.custom_entry.pack(side="left", padx=4)
+        ctk.CTkButton(cf, text="Set", width=44, height=26, font=(FONT, 10),
+                      corner_radius=5, fg_color=ACCENT, hover_color=ACCENT_H,
+                      command=self._set_custom_time).pack(side="left")
 
-        # Warning label
-        self.time_warning = ctk.CTkLabel(
-            right, text="",
-            font=(FONT_FAMILY, 10), text_color=COLOR_YELLOW,
-            wraplength=260,
-        )
-        self.time_warning.pack(anchor="w", padx=16, pady=(2, 10))
+        # Warning
+        self.time_warn = ctk.CTkLabel(right, text="", font=(FONT, 10),
+                                      text_color=YELLOW, wraplength=240)
+        self.time_warn.pack(anchor="w", padx=14, pady=(0, 4))
 
-        # ====== BOTTOM BAR — Controls & Progress ======
-        bottom = ctk.CTkFrame(self, fg_color=COLOR_CARD, corner_radius=0, height=110)
-        bottom.pack(fill="x", side="bottom")
-        bottom.pack_propagate(False)
+        # --- Advanced toggle ---
+        ctk.CTkFrame(right, fg_color=BORDER, height=1).pack(fill="x", padx=14, pady=6)
+        self.adv_open = False
+        self.adv_btn = ctk.CTkButton(
+            right, text="Advanced Settings  +", width=200, height=30,
+            font=(FONT, 12), corner_radius=8,
+            fg_color="transparent", hover_color="#22222e",
+            text_color=DIM, command=self._toggle_advanced)
+        self.adv_btn.pack(anchor="w", padx=14, pady=(0, 4))
 
-        ctrl = ctk.CTkFrame(bottom, fg_color="transparent")
-        ctrl.pack(fill="x", padx=20, pady=(12, 4))
+        self.adv_frame = ctk.CTkFrame(right, fg_color="transparent")
+        # NOT packed — hidden by default
+
+        # Build advanced sliders inside adv_frame
+        self.speed_var = tk.DoubleVar(value=1.0)
+        self._slider(self.adv_frame, "Speed Multiplier", self.speed_var,
+                     0.3, 3.0, "x", 0.1)
+        self.wpm_var = tk.DoubleVar(value=48.0)
+        self._slider(self.adv_frame, "Base WPM", self.wpm_var, 20, 120, "wpm", 2)
+        self.error_var = tk.DoubleVar(value=1.4)
+        self._slider(self.adv_frame, "Typo Rate", self.error_var, 0, 8, "%", 0.1)
+        self.think_var = tk.DoubleVar(value=0.6)
+        self._slider(self.adv_frame, "Thinking Pauses", self.think_var,
+                     0, 5, "%", 0.1)
+        self.distract_var = tk.DoubleVar(value=0.08)
+        self._slider(self.adv_frame, "Distraction Breaks", self.distract_var,
+                     0, 2, "%", 0.02)
+        self.save_var = tk.IntVar(value=300)
+        self._slider(self.adv_frame, "Save Pause Interval", self.save_var,
+                     50, 1000, "chars", 50)
+        self.cd_var = tk.IntVar(value=5)
+        self._slider(self.adv_frame, "Countdown", self.cd_var, 3, 15, "sec", 1)
+
+        # Mode radio
+        mode_f = ctk.CTkFrame(self.adv_frame, fg_color="transparent")
+        mode_f.pack(fill="x", padx=4, pady=(8, 4))
+        self.mode_var = tk.StringVar(value="auto")
+        ctk.CTkRadioButton(mode_f, text="Auto", variable=self.mode_var,
+                           value="auto", font=(FONT, 11), text_color=DIM,
+                           fg_color=ACCENT, command=self._mode_changed
+                           ).pack(side="left", padx=(0, 10))
+        ctk.CTkRadioButton(mode_f, text="Manual", variable=self.mode_var,
+                           value="manual", font=(FONT, 11), text_color=DIM,
+                           fg_color=ACCENT, command=self._mode_changed
+                           ).pack(side="left")
+
+        # ========== BOTTOM BAR ==========
+        bot = ctk.CTkFrame(self, fg_color=CARD, corner_radius=0, height=100)
+        bot.pack(fill="x", side="bottom")
+        bot.pack_propagate(False)
+
+        ctrl = ctk.CTkFrame(bot, fg_color="transparent")
+        ctrl.pack(fill="x", padx=16, pady=(10, 2))
 
         self.start_btn = ctk.CTkButton(
-            ctrl, text="Start Typing", width=150, height=40,
-            font=(FONT_FAMILY, 14, "bold"), corner_radius=10,
-            fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER,
-            command=self._start,
-        )
-        self.start_btn.pack(side="left", padx=(0, 10))
+            ctrl, text="Start Typing", width=140, height=38,
+            font=(FONT, 13, "bold"), corner_radius=10,
+            fg_color=ACCENT, hover_color=ACCENT_H, command=self._start)
+        self.start_btn.pack(side="left", padx=(0, 8))
 
         self.stop_btn = ctk.CTkButton(
-            ctrl, text="Stop", width=100, height=40,
-            font=(FONT_FAMILY, 14, "bold"), corner_radius=10,
-            fg_color=COLOR_RED, hover_color=COLOR_RED_HOVER,
-            state="disabled", command=self._stop,
-        )
-        self.stop_btn.pack(side="left", padx=(0, 20))
+            ctrl, text="Stop", width=90, height=38,
+            font=(FONT, 13, "bold"), corner_radius=10,
+            fg_color=RED, hover_color=RED_H,
+            state="disabled", command=self._stop)
+        self.stop_btn.pack(side="left", padx=(0, 16))
 
-        self.status_label = ctk.CTkLabel(
-            ctrl, text="Ready  --  Paste text and adjust settings",
-            font=(FONT_FAMILY, 12), text_color=COLOR_TEXT_DIM,
-        )
-        self.status_label.pack(side="left", fill="x", expand=True)
+        self.status = ctk.CTkLabel(ctrl, text="Ready -- load or paste text",
+                                   font=(FONT, 11), text_color=DIM)
+        self.status.pack(side="left", fill="x", expand=True)
 
-        self.elapsed_label = ctk.CTkLabel(
-            ctrl, text="",
-            font=(FONT_FAMILY, 12), text_color=COLOR_GREEN,
-        )
-        self.elapsed_label.pack(side="right")
+        self.elapsed = ctk.CTkLabel(ctrl, text="", font=(FONT, 11),
+                                    text_color=GREEN)
+        self.elapsed.pack(side="right")
 
-        prog_frame = ctk.CTkFrame(bottom, fg_color="transparent")
-        prog_frame.pack(fill="x", padx=20, pady=(2, 14))
-
-        self.progress = ctk.CTkProgressBar(
-            prog_frame, height=10, corner_radius=5,
-            fg_color=COLOR_INPUT_BG, progress_color=COLOR_ACCENT,
-        )
+        pf = ctk.CTkFrame(bot, fg_color="transparent")
+        pf.pack(fill="x", padx=16, pady=(2, 12))
+        self.progress = ctk.CTkProgressBar(pf, height=8, corner_radius=4,
+                                           fg_color=INPUT, progress_color=ACCENT)
         self.progress.pack(fill="x")
         self.progress.set(0)
 
-    # ------------------------------------------------------------------
-    # Slider factory
-    # ------------------------------------------------------------------
-    def _make_slider(self, parent, label, var, from_, to, suffix,
-                     resolution=1):
-        frame = ctk.CTkFrame(parent, fg_color="transparent")
-        frame.pack(fill="x", padx=16, pady=(0, 8))
+    # ==================================================================
+    # SLIDER FACTORY
+    # ==================================================================
+    def _slider(self, parent, label, var, lo, hi, suffix, res):
+        f = ctk.CTkFrame(parent, fg_color="transparent")
+        f.pack(fill="x", padx=4, pady=(0, 6))
+        row = ctk.CTkFrame(f, fg_color="transparent")
+        row.pack(fill="x")
+        ctk.CTkLabel(row, text=label, font=(FONT, 11),
+                     text_color=DIM).pack(side="left")
+        vl = ctk.CTkLabel(row, text=self._fv(var.get(), suffix),
+                          font=(FONT, 11, "bold"), text_color=TEXT)
+        vl.pack(side="right")
+        ctk.CTkSlider(f, from_=lo, to=hi, variable=var,
+                      height=14, corner_radius=7, fg_color=INPUT,
+                      progress_color=ACCENT, button_color=ACCENT,
+                      button_hover_color=ACCENT_H).pack(fill="x", pady=(2, 0))
 
-        top_row = ctk.CTkFrame(frame, fg_color="transparent")
-        top_row.pack(fill="x")
-
-        ctk.CTkLabel(
-            top_row, text=label,
-            font=(FONT_FAMILY, 12), text_color=COLOR_TEXT_DIM,
-        ).pack(side="left")
-
-        val_label = ctk.CTkLabel(
-            top_row, text=self._fmt_val(var.get(), suffix),
-            font=(FONT_FAMILY, 12, "bold"), text_color=COLOR_TEXT,
-        )
-        val_label.pack(side="right")
-
-        slider = ctk.CTkSlider(
-            frame, from_=from_, to=to, variable=var,
-            width=200, height=16, corner_radius=8,
-            fg_color=COLOR_INPUT_BG,
-            progress_color=COLOR_ACCENT,
-            button_color=COLOR_ACCENT,
-            button_hover_color=COLOR_ACCENT_HOVER,
-        )
-        slider.pack(fill="x", pady=(2, 0))
-
-        def _on_change(*_):
-            if self._suppressing_trace:
+        def _chg(*_):
+            if self._suppress:
                 return
             raw = var.get()
-            if resolution >= 1:
-                snapped = round(raw / resolution) * resolution
-                snapped = int(snapped)
+            if res >= 1:
+                s = int(round(raw / res) * res)
             else:
-                snapped = round(raw / resolution) * resolution
-                snapped = round(snapped, 3)
-            self._suppressing_trace = True
-            var.set(snapped)
-            self._suppressing_trace = False
-            val_label.configure(text=self._fmt_val(snapped, suffix))
-            # If user moves a manual slider, switch to manual mode
-            if self._auto_mode and not self._suppressing_trace:
+                s = round(round(raw / res) * res, 3)
+            self._suppress = True
+            var.set(s)
+            self._suppress = False
+            vl.configure(text=self._fv(s, suffix))
+            if self._auto_mode:
                 self._auto_mode = False
                 self.mode_var.set("manual")
-            self._update_stats()
-
-        var.trace_add("write", _on_change)
+            self._refresh()
+        var.trace_add("write", _chg)
+        self._slider_labels[id(var)] = (vl, suffix)
 
     @staticmethod
-    def _fmt_val(v, suffix):
-        if isinstance(v, float):
-            return f"{v:.1f} {suffix}"
-        return f"{v} {suffix}"
+    def _fv(v, s):
+        return f"{v:.1f} {s}" if isinstance(v, float) else f"{v} {s}"
 
-    # ------------------------------------------------------------------
-    # Stat rows
-    # ------------------------------------------------------------------
-    def _make_stat_row(self, parent, label, value):
-        row = ctk.CTkFrame(parent, fg_color="transparent")
-        row.pack(fill="x", padx=12, pady=3)
-        ctk.CTkLabel(
-            row, text=label,
-            font=(FONT_FAMILY, 12), text_color=COLOR_TEXT_DIM,
-        ).pack(side="left")
-        val = ctk.CTkLabel(
-            row, text=value,
-            font=(FONT_FAMILY, 12, "bold"), text_color=COLOR_TEXT,
-        )
-        val.pack(side="right")
-        return val
+    def _stat(self, parent, label, val):
+        r = ctk.CTkFrame(parent, fg_color="transparent")
+        r.pack(fill="x", padx=10, pady=2)
+        ctk.CTkLabel(r, text=label, font=(FONT, 11), text_color=DIM).pack(side="left")
+        v = ctk.CTkLabel(r, text=val, font=(FONT, 11, "bold"), text_color=TEXT)
+        v.pack(side="right")
+        return v
 
-    # ------------------------------------------------------------------
-    # Actions
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # ADVANCED TOGGLE
+    # ==================================================================
+    def _toggle_advanced(self):
+        self.adv_open = not self.adv_open
+        if self.adv_open:
+            self.adv_frame.pack(fill="x", padx=14, pady=(0, 8))
+            self.adv_btn.configure(text="Advanced Settings  -")
+        else:
+            self.adv_frame.pack_forget()
+            self.adv_btn.configure(text="Advanced Settings  +")
+
+    # ==================================================================
+    # ACTIONS
+    # ==================================================================
     def _load_file(self):
-        path = filedialog.askopenfilename(
-            filetypes=[("Text files", "*.txt *.md *.doc"),
-                       ("All files", "*.*")])
+        path = filedialog.askopenfilename(filetypes=[
+            ("All supported", "*.txt *.md *.docx *.pdf"),
+            ("Text files", "*.txt *.md"),
+            ("Word documents", "*.docx"),
+            ("PDF files", "*.pdf"),
+            ("All files", "*.*"),
+        ])
         if path:
-            with open(path, 'r', encoding='utf-8', errors='replace') as f:
-                content = f.read()
-            self.text_box.delete("1.0", "end")
-            self.text_box.insert("1.0", content)
-            self._update_stats()
-
-    def _paste_clipboard(self):
-        try:
-            content = self.clipboard_get()
-            if content:
+            try:
+                content = load_text_file(path)
                 self.text_box.delete("1.0", "end")
                 self.text_box.insert("1.0", content)
-                self._update_stats()
+                self._refresh()
+            except Exception as e:
+                self.status.configure(
+                    text=f"Error loading file: {e}", text_color=RED)
+
+    def _paste(self):
+        try:
+            c = self.clipboard_get()
+            if c:
+                self.text_box.delete("1.0", "end")
+                self.text_box.insert("1.0", c)
+                self._refresh()
         except tk.TclError:
             pass
 
-    def _clear_text(self):
+    def _clear(self):
         self.text_box.delete("1.0", "end")
-        self._update_stats()
+        self.ai_bar.pack_forget()
+        self._refresh()
 
-    def _get_text(self) -> str:
-        return self.text_box.get("1.0", "end").rstrip('\n')
+    def _txt(self) -> str:
+        return self.text_box.get("1.0", "end").strip()
 
-    def _build_profile(self) -> TypingProfile:
+    # ==================================================================
+    # AI CLEANUP
+    # ==================================================================
+    def _check_ai(self):
+        text = self._txt()
+        if not text.strip():
+            self.ai_bar.pack_forget()
+            return
+        hits = ai_scan(text)
+        if hits:
+            total = sum(h["count"] for h in hits)
+            names = ", ".join(h["description"] for h in hits[:3])
+            more = f" +{len(hits)-3} more" if len(hits) > 3 else ""
+            self.ai_label.configure(
+                text=f"{total} AI artifacts found: {names}{more}")
+            self.ai_bar.pack(fill="x", padx=14, pady=(0, 10))
+        else:
+            self.ai_bar.pack_forget()
+
+    def _do_ai_cleanup(self):
+        text = self._txt()
+        cleaned = ai_clean(text, selected_names=None)
+        self.text_box.delete("1.0", "end")
+        self.text_box.insert("1.0", cleaned)
+        self.ai_bar.pack_forget()
+        self._refresh()
+        self.status.configure(text="AI artifacts cleaned", text_color=GREEN)
+
+    # ==================================================================
+    # PROFILE
+    # ==================================================================
+    def _profile(self) -> TypingProfile:
         p = TypingProfile()
         p.speed_multiplier = self.speed_var.get()
         p.base_wpm = self.wpm_var.get()
         p.error_rate = self.error_var.get() / 100.0
-        p.thinking_probability = self.thinking_var.get() / 100.0
-        p.distraction_probability = self.distraction_var.get() / 100.0
+        p.thinking_probability = self.think_var.get() / 100.0
+        p.distraction_probability = self.distract_var.get() / 100.0
         p.save_pause_interval = max(10, int(self.save_var.get()))
-        p.countdown_seconds = int(self.countdown_var.get())
+        p.countdown_seconds = int(self.cd_var.get())
         return p
 
-    def _on_mode_change(self):
-        self._auto_mode = (self.mode_var.get() == "auto")
-        if self._auto_mode:
-            self._on_desired_time_change()
-
-    def _on_desired_time_slider(self, *_):
-        if self._suppressing_trace:
+    # ==================================================================
+    # DESIRED TIME
+    # ==================================================================
+    def _on_desired_change(self, *_):
+        if self._suppress:
             return
-        secs = self.desired_time_var.get()
-        self.desired_time_label.configure(text=format_duration(secs))
+        secs = self.desired_var.get()
+        self.desired_label.configure(text=format_duration(secs))
         if self._auto_mode:
-            self._on_desired_time_change()
+            self._solve_for_time()
 
-    def _on_custom_time_set(self):
+    def _set_custom_time(self):
         try:
-            mins = float(self.custom_time_entry.get())
-            secs = mins * 60.0
-            secs = max(self._min_time_seconds, secs)
-            self._suppressing_trace = True
-            self.desired_time_var.set(secs)
-            self._suppressing_trace = False
-            self.desired_time_label.configure(text=format_duration(secs))
+            mins = float(self.custom_entry.get())
+            secs = max(self._min_time, mins * 60.0)
+            self._suppress = True
+            self.desired_var.set(secs)
+            self._suppress = False
+            self.desired_label.configure(text=format_duration(secs))
             self._auto_mode = True
             self.mode_var.set("auto")
-            self._on_desired_time_change()
+            self._solve_for_time()
         except ValueError:
             pass
 
-    def _on_desired_time_change(self):
-        """Solve parameters to match the desired time and push to sliders."""
-        text = self._get_text()
+    def _mode_changed(self):
+        self._auto_mode = (self.mode_var.get() == "auto")
+        if self._auto_mode:
+            self._solve_for_time()
+
+    def _solve_for_time(self):
+        text = self._txt()
         if not text.strip():
             return
-        target = self.desired_time_var.get()
+        target = self.desired_var.get()
         if target <= 0:
             return
-
-        # Build a base profile preserving error/save/countdown from current
-        base = self._build_profile()
+        base = self._profile()
         solved = solve_profile_for_time(text, target, base)
-
-        # Push solved values into sliders without triggering manual-mode switch
-        self._suppressing_trace = True
+        self._suppress = True
         self.speed_var.set(round(solved.speed_multiplier, 1))
-        self.wpm_var.set(round(solved.base_wpm / 5) * 5)
-        self.thinking_var.set(round(solved.thinking_probability * 100, 1))
-        self.distraction_var.set(round(solved.distraction_probability * 100, 2))
-        self._suppressing_trace = False
+        self.wpm_var.set(round(solved.base_wpm / 2) * 2)
+        self.think_var.set(round(solved.thinking_probability * 100, 1))
+        self.distract_var.set(round(solved.distraction_probability * 100, 2))
+        self._suppress = False
 
-        # Show warning if below default estimate
-        if target < self._default_est_seconds:
-            self.time_warning.configure(
-                text="Below recommended time -- may look less natural",
-                text_color=COLOR_YELLOW)
-        elif target < self._min_time_seconds * 1.5:
-            self.time_warning.configure(
-                text="Near minimum -- very fast typing",
-                text_color=COLOR_RED)
+        # Update slider value labels (since _suppress blocked _chg callbacks)
+        self._update_slider_labels()
+
+        # Warning — check severe first, then mild
+        if self._min_time > 0 and target < self._min_time * 1.5:
+            self.time_warn.configure(text="Near minimum -- very fast",
+                                     text_color=RED)
+        elif self._default_est > 0 and target < self._default_est:
+            self.time_warn.configure(
+                text="Below recommended -- may look less natural",
+                text_color=YELLOW)
         else:
-            self.time_warning.configure(text="")
+            self.time_warn.configure(text="")
 
-        self._update_stats()
+        # Update est label directly (no _refresh to avoid loops)
+        p = self._profile()
+        est = estimate_time(text, p)
+        self.stat_est.configure(text=format_duration(est))
 
-    def _update_stats(self):
-        text = self._get_text()
+    def _update_slider_labels(self):
+        """Sync all slider value labels with their current var values."""
+        for var in [self.speed_var, self.wpm_var, self.error_var,
+                    self.think_var, self.distract_var, self.save_var, self.cd_var]:
+            key = id(var)
+            if key in self._slider_labels:
+                lbl, suffix = self._slider_labels[key]
+                lbl.configure(text=self._fv(var.get(), suffix))
+
+    # ==================================================================
+    # REFRESH STATS
+    # ==================================================================
+    def _debounced_refresh(self):
+        """Debounce text changes: wait 300ms after last keystroke."""
+        if self._refresh_timer is not None:
+            self.after_cancel(self._refresh_timer)
+        self._refresh_timer = self.after(300, self._refresh)
+
+    def _refresh(self):
+        self._refresh_timer = None
+        text = self._txt()
         if not text.strip():
             self.stat_chars.configure(text="0")
             self.stat_words.configure(text="0")
-            self.stat_sentences.configure(text="0")
             self.stat_est.configure(text="--")
-            self.desired_time_label.configure(text="--")
-            self.time_warning.configure(text="")
+            self.desired_label.configure(text="--")
+            self.time_warn.configure(text="")
             return
+
         chars = len(text)
         words = len(text.split())
-        sents = text.count('.') + text.count('!') + text.count('?')
-        profile = self._build_profile()
-        est = estimate_time(text, profile)
+        p = self._profile()
+        est = estimate_time(text, p)
         self.stat_chars.configure(text=f"{chars:,}")
         self.stat_words.configure(text=f"{words:,}")
-        self.stat_sentences.configure(text=f"{sents:,}")
         self.stat_est.configure(text=format_duration(est))
 
-        # Recompute default estimate and min time for slider bounds
         default_p = TypingProfile()
-        self._default_est_seconds = estimate_time(text, default_p)
-        self._min_time_seconds = compute_minimum_time(text)
+        self._default_est = estimate_time(text, default_p)
+        self._min_time = compute_minimum_time(text)
 
-        # Update desired-time slider range: min .. default + 2 hours
-        max_time = self._default_est_seconds + 7200
-        self._suppressing_trace = True
-        self.desired_slider.configure(from_=self._min_time_seconds, to=max_time)
-        # If desired time hasn't been set yet, initialize to default
-        if self.desired_time_var.get() < self._min_time_seconds:
-            self.desired_time_var.set(self._default_est_seconds)
-            self.desired_time_label.configure(
-                text=format_duration(self._default_est_seconds))
-        self._suppressing_trace = False
+        max_t = self._default_est + 7200
+        self._suppress = True
+        self.desired_slider.configure(from_=self._min_time, to=max_t)
+        need_init = self.desired_var.get() < self._min_time
+        if need_init:
+            self.desired_var.set(self._default_est)
+            self.desired_label.configure(text=format_duration(self._default_est))
+        self._suppress = False
 
-    # ------------------------------------------------------------------
-    # Start / Stop
-    # ------------------------------------------------------------------
+        # If we just initialized the desired time and auto mode, solve now
+        if need_init and self._auto_mode:
+            self._solve_for_time()
+
+        # Check for AI artifacts
+        self._check_ai()
+
+    # ==================================================================
+    # START / STOP
+    # ==================================================================
     def _start(self):
-        text = self._get_text()
+        text = self._txt()
         if not text.strip():
-            self.status_label.configure(text="No text to type!", text_color=COLOR_RED)
+            self.status.configure(text="No text to type!", text_color=RED)
             return
-
         self._is_running = True
         self._stop_flag = False
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.progress.set(0)
-
-        profile = self._build_profile()
-        countdown_sec = profile.countdown_seconds
-
-        # Countdown in a thread so the UI stays responsive
+        profile = self._profile()
         self._typing_thread = threading.Thread(
-            target=self._run_typing, args=(text, profile, countdown_sec),
-            daemon=True
-        )
+            target=self._run, args=(text, profile, profile.countdown_seconds),
+            daemon=True)
         self._typing_thread.start()
 
     def _stop(self):
         self._stop_flag = True
-        self.status_label.configure(
-            text="Stopping...", text_color=COLOR_RED
-        )
+        self.status.configure(text="Stopping...", text_color=RED)
 
-    def _run_typing(self, text, profile, countdown_sec):
-        # --- Countdown ---
-        for i in range(countdown_sec, 0, -1):
+    def _run(self, text, profile, cd):
+        import time as _t
+        for i in range(cd, 0, -1):
             if self._stop_flag:
-                self._finish("Aborted during countdown")
+                self._done("Aborted")
                 return
-            self.after(0, lambda s=i: self.status_label.configure(
-                text=f"Place cursor in Google Docs!  Starting in {s}...",
-                text_color="#f0c040"
-            ))
-            import time
-            time.sleep(1)
+            self.after(0, lambda s=i: self.status.configure(
+                text=f"Switch to your document now!  {s}...",
+                text_color=YELLOW))
+            _t.sleep(1)
 
-        self.after(0, lambda: self.status_label.configure(
-            text="Typing...", text_color=COLOR_GREEN
-        ))
+        self.after(0, lambda: self.status.configure(
+            text="Typing...", text_color=GREEN))
 
-        # --- Type ---
-        def on_progress(done, total, elapsed):
+        def prog(done, total, el):
             if total > 0:
-                pct = done / total
-                self.after(0, lambda p=pct, e=elapsed: self._update_progress(p, e))
+                self.after(0, lambda p=done/total, e=el: [
+                    self.progress.set(p),
+                    self.elapsed.configure(text=format_duration(e))])
 
-        chars, elapsed = type_text(
-            text, profile,
-            on_progress=on_progress,
-            should_stop=lambda: self._stop_flag,
-        )
+        try:
+            chars, el = type_text(text, profile,
+                                  on_progress=prog,
+                                  should_stop=lambda: self._stop_flag)
+        except Exception as e:
+            self._done(f"Stopped: {type(e).__name__}")
+            return
 
         if self._stop_flag:
-            self._finish(f"Stopped after {chars:,} chars  ({format_duration(elapsed)})")
+            self._done(f"Stopped after {chars:,} chars ({format_duration(el)})")
         else:
-            self._finish(f"Done!  {chars:,} chars in {format_duration(elapsed)}")
+            self._done(f"Done!  {chars:,} chars in {format_duration(el)}")
 
-    def _update_progress(self, pct, elapsed):
-        self.progress.set(pct)
-        self.elapsed_label.configure(text=format_duration(elapsed))
-
-    def _finish(self, msg):
+    def _done(self, msg):
         self._is_running = False
         self.after(0, lambda: [
             self.start_btn.configure(state="normal"),
             self.stop_btn.configure(state="disabled"),
-            self.status_label.configure(text=msg, text_color=COLOR_TEXT),
-            self.progress.set(1.0 if "Done" in msg else self.progress.get()),
-        ])
+            self.status.configure(text=msg, text_color=TEXT),
+            self.progress.set(1.0 if "Done" in msg else self.progress.get())])
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    app = TypeflowApp()
-    app.mainloop()
+    TypeflowApp().mainloop()
