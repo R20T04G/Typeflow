@@ -16,7 +16,7 @@ Typeflow takes your text and replays it character-by-character as if a real pers
 
 ## Features
 
-- **Research-backed typing patterns** -- 48 WPM default (average student speed), with natural variance and fatigue
+- **Research-backed typing patterns** -- 55 WPM smooth default, with natural variance and fatigue
 - **Linguistic pause logic** -- pauses before conjunctions ("however", "because"), at sentence ends, paragraph breaks, and after long words
 - **Burst typing** -- types in bursts of 3-8 characters like real humans, with micro-pauses between
 - **Word-frequency speed** -- common words ("the", "and") typed faster, rare words slower
@@ -86,8 +86,7 @@ Click **Advanced Settings** to access all parameters:
 
 ### 6. Stop anytime
 
-- Click **Stop**, or
-- Move your mouse to the **top-left corner** of the screen (emergency abort)
+- Click **Stop** to end the typing session
 
 ---
 
@@ -102,31 +101,53 @@ python typeflow.py --file essay.txt --dry-run
 
 ---
 
-## 📦 How to Publish a Release on GitHub
+## Publish a Release on GitHub
 
-Once you have generated `Typeflow.exe` (or downloaded it), you can easily share it with others by creating a GitHub Release on your repository. Anyone visiting your repository will be able to download the `.exe` without needing Python installed.
+Use GitHub Releases for distributing the Windows executable. Keep `dist/` in `.gitignore` and upload the `.exe` as a release asset instead of committing it to the repository.
 
-### Step-by-Step Guide:
-1. **Find your `.exe` file:**
-   - Look inside the `dist` folder in your project directory (e.g., `Typeflow/dist/Typeflow.exe`).
-2. **Go to your GitHub Repository:**
-   - Open your web browser and navigate to your GitHub repository page.
-3. **Create a New Release:**
-   - On the right side of your repository page, click on **"Releases"**.
-   - Click the **"Draft a new release"** button.
-4. **Fill out Release Details:**
-   - **Choose a tag:** Click the dropdown and type a version number (e.g., `v1.0.0`), then click "Create new tag".
-   - **Release title:** Give it a clear name (e.g., "Typeflow v1.0.0 - Initial Release").
-   - **Describe this release:** Write a brief description of what the program does. You can copy the "Features" section from this README.
-5. **Upload the Executable:**
-   - Below the description box, you will see a section that says "Attach binaries by dropping them here or selecting them".
-   - Drag and drop your `Typeflow.exe` file from the `dist` folder into this box, and wait for it to upload.
-6. **Publish:**
-   - Click the green **"Publish release"** button.
+### 1. Build the executable
 
-Congratulations! Users can now navigate to the "Releases" section of your GitHub repo, download `Typeflow.exe`, and run it instantly.
+```bash
+pip install -r requirements.txt
+pip install pyinstaller
+python build.py
+```
 
-Share `dist/Typeflow.exe` -- no Python required.
+Build output:
+- `dist/Typeflow.exe`
+
+### 2. Commit source changes (not `dist/`)
+
+```bash
+git add .
+git commit -m "Release prep v1.0.0"
+git push origin main
+```
+
+### 3. Create a Git tag and push it
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+### 4. Publish the GitHub Release
+
+1. Open your repository on GitHub.
+2. Go to **Releases** -> **Draft a new release**.
+3. Select tag `v1.0.0`.
+4. Title example: **Typeflow v1.0.0**.
+5. Add release notes (what changed).
+6. Attach `dist/Typeflow.exe`.
+7. Click **Publish release**.
+
+After publishing, users download the app from the **Releases** page, not from the repository file tree.
+
+### Optional: GitHub CLI release
+
+```bash
+gh release create v1.0.0 dist/Typeflow.exe -t "Typeflow v1.0.0" -n "Initial public release"
+```
 
 ---
 
