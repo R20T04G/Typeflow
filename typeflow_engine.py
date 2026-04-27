@@ -6,15 +6,20 @@ Key improvements over v1:
 - Burst typing (3-8 chars fast, then micro-pause)
 - Word-frequency speed variation (common words typed faster)
 - Improved typo model (transpositions, omissions, doubles)
-- Research-backed defaults (48 WPM average student)
+- Research-backed defaults (55 WPM smooth baseline)
 """
 
 import time
 import random
+import re
 import pyautogui
 
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0
+
+STRIP_PUNCT = '.,!?;:'
+AUTO_LIST_PREFIX_RE = re.compile(r'^\s*(?:\d+[.)]|[A-Za-z][.)])\s+\S')
+AUTO_LIST_MARKER_RE = re.compile(r'^(\d+[\.\)]|[a-zA-Z][\.\)]|[-*•])$')
 
 # ---------------------------------------------------------------------------
 # Keyboard layout for typos
@@ -86,9 +91,9 @@ class TypingProfile:
 
     def __init__(self):
         # --- Speed (research: avg student ~41-52 WPM, experienced ~65) ---
-        self.base_wpm: float = 48.0
+        self.base_wpm: float = 55.0
         self.speed_multiplier: float = 1.0
-        self.wpm_variance: float = 0.25
+        self.wpm_variance: float = 0.22
 
         # --- Burst typing ---
         self.burst_length: tuple = (3, 8)       # chars per burst
@@ -99,7 +104,7 @@ class TypingProfile:
         self.uncommon_word_slowdown: float = 0.20  # 20% slower for rare words
 
         # --- Errors ---
-        self.error_rate: float = 0.014
+        self.error_rate: float = 0.018
         self.long_word_error_boost: float = 0.006
         self.max_consecutive_errors: int = 2
         # Error type weights (must sum to ~1.0)
@@ -139,6 +144,9 @@ class TypingProfile:
         # --- Countdown ---
         self.countdown_seconds: int = 5
 
+        # --- Compatibility helpers ---
+        self.docs_autolist_guard: bool = True
+
     def effective_wpm(self, chars_typed: int, word: str = "") -> float:
         """WPM adjusted for multiplier, variance, fatigue, word familiarity."""
         wpm = self.base_wpm * self.speed_multiplier
@@ -146,7 +154,7 @@ class TypingProfile:
         wpm *= (1.0 + random.uniform(-self.wpm_variance, self.wpm_variance))
         # Word familiarity
         if word:
-            w = word.lower().strip('.,!?;:')
+            w = word.lower().strip(STRIP_PUNCT)
             if w in COMMON_WORDS:
                 wpm *= (1.0 + self.common_word_speedup)
             elif len(w) > 6:
@@ -164,7 +172,7 @@ class TypingProfile:
         cpm = wpm * 5.0
         base = 60.0 / cpm
         jitter = random.uniform(-0.35, 0.35)
-        return max(0.02, base * (1.0 + jitter))
+        return max(0.001, base * (1.0 + jitter))
 
     def error_chance(self, word: str, pos_in_word: int) -> float:
         """Error probability for a character."""
@@ -268,7 +276,7 @@ def estimate_time(text: str, profile: TypingProfile) -> float:
 
     # Conjunction/transition pauses (estimate from word count)
     words = text.lower().split()
-    conj_count = sum(1 for w in words if w.strip('.,!?;:') in THINKING_TRIGGERS_BEFORE)
+    conj_count = sum(1 for w in words if w.strip(STRIP_PUNCT) in THINKING_TRIGGERS_BEFORE)
     pause_s += conj_count * sum(profile.pause_before_conjunction) / 2
 
     # Thinking & distraction
@@ -297,9 +305,9 @@ def compute_minimum_time(text: str) -> float:
     if word_count == 0:
         return 0.0
     # WPM-based floor
-    wpm_floor = (word_count / 360.0) * 60.0
-    # char_delay floor: 0.02s per character minimum
-    char_floor = char_count * 0.02
+    wpm_floor = (word_count / 1000.0) * 60.0  # 1000 WPM theoretical max for simulation
+    # char_delay floor: 0.001s per character minimum
+    char_floor = char_count * 0.001
     return max(wpm_floor, char_floor)
 
 
@@ -322,7 +330,6 @@ def solve_profile_for_time(text: str, target_seconds: float,
 
     # Compute fixed overhead (punctuation + conjunctions + save)
     default_est = estimate_time(text, p)
-    base_typing = (word_count / p.base_wpm) * 60.0
 
     # Simple ratio approach: scale speed to hit target
     if default_est > 0:
@@ -356,10 +363,22 @@ def solve_profile_for_time(text: str, target_seconds: float,
         p.distraction_probability = 0.0
         remaining = target_seconds - estimate_time(text, p)
         if remaining < -5:
+            # We are still too slow. Zero out all structural pauses
+            p.pause_after_period = (0.0, 0.0)
+            p.pause_after_comma = (0.0, 0.0)
+            p.pause_after_semicolon = (0.0, 0.0)
+            p.pause_after_paragraph = (0.0, 0.0)
+            p.pause_before_conjunction = (0.0, 0.0)
+            p.pause_before_transition = (0.0, 0.0)
+            p.pause_after_long_word = (0.0, 0.0)
+            p.word_gap = (0.0, 0.0)
+            p.burst_pause = (0.0, 0.0)
+            
             cur_typing = (word_count / (p.base_wpm * p.speed_multiplier)) * 60
-            needed = max(1.0, cur_typing + remaining)
+            needed = max(0.1, cur_typing + remaining)
             new_speed = (word_count / p.base_wpm) * 60.0 / needed
-            p.speed_multiplier = max(0.3, min(3.0, round(new_speed, 2)))
+            p.speed_multiplier = max(0.3, round(new_speed, 2))  # No arbitrary upper limit
+
 
     return p
 
@@ -389,17 +408,6 @@ def _type_char(ch: str):
         pyautogui.press(ch)
 
 
-def _find_current_word(text: str, pos: int) -> str:
-    """Extract the word surrounding position pos."""
-    start = pos
-    while start > 0 and text[start - 1] not in (' ', '\t', '\n', '\r'):
-        start -= 1
-    end = pos
-    while end < len(text) and text[end] not in (' ', '\t', '\n', '\r'):
-        end += 1
-    return text[start:end]
-
-
 def _check_transition_ahead(text: str, pos: int) -> bool:
     """Check if a multi-word transition phrase starts near pos."""
     snippet = text[pos:pos + 30].lower()
@@ -409,9 +417,15 @@ def _check_transition_ahead(text: str, pos: int) -> bool:
     return False
 
 
+def _line_before(text: str, pos: int) -> str:
+    """Return the line content immediately before text[pos]."""
+    line_start = text.rfind('\n', 0, pos) + 1
+    return text[line_start:pos]
+
+
 def type_text(text: str, profile: TypingProfile,
               on_progress=None, should_stop=None, check_pause=None,
-              get_resume_index=None, start_index=0):
+              get_resume_index=None, start_index=0, get_live_profile=None):
     """
     Simulate human typing with research-backed patterns.
 
@@ -424,34 +438,56 @@ def type_text(text: str, profile: TypingProfile,
     burst_counter = random.randint(*profile.burst_length)
     start_time = time.time()
 
+    word_start = -1
+    word_end = -1
+    current_word = ""
+    w_lower = ""
+    prev_word_len = 0
+
     i = max(0, min(int(start_index), total_chars))
     while i < total_chars:
+        if get_live_profile:
+            live_profile = get_live_profile()
+            if live_profile is not None:
+                profile = live_profile
+
         if should_stop and should_stop():
             return chars_typed, time.time() - start_time
 
         if check_pause:
             while check_pause():
-                if get_resume_index:
-                    try:
-                        requested = int(get_resume_index())
-                        i = max(0, min(requested, total_chars))
-                    except (TypeError, ValueError):
-                        pass
+                if get_live_profile:
+                    live_profile = get_live_profile()
+                    if live_profile is not None:
+                        profile = live_profile
                 time.sleep(0.1)
                 if should_stop and should_stop():
                     return chars_typed, time.time() - start_time
 
 
         ch = text[i]
-        current_word = _find_current_word(text, i)
-        word_start = i
-        while word_start > 0 and text[word_start - 1] not in (' ', '\t', '\n', '\r'):
-            word_start -= 1
+        
+        # Fast-forward word boundaries (O(1) tracking)
+        if i >= word_end or word_start > i:
+            if current_word:
+                prev_word_len = len(current_word)
+            ws = i
+            while ws > 0 and text[ws - 1] not in (' ', '\t', '\n', '\r'):
+                ws -= 1
+            word_start = ws
+            
+            we = i
+            while we < total_chars and text[we] not in (' ', '\t', '\n', '\r'):
+                we += 1
+            word_end = we
+            
+            current_word = text[word_start:word_end]
+            w_lower = current_word.lower().strip(STRIP_PUNCT)
+            
         pos_in_word = i - word_start
 
         # --- Linguistic pause BEFORE this word ---
         if pos_in_word == 0 and ch not in (' ', '\t', '\n', '\r'):
-            w_lower = current_word.lower().strip('.,!?;:')
             if w_lower in THINKING_TRIGGERS_BEFORE:
                 time.sleep(random.uniform(*profile.pause_before_conjunction))
             elif _check_transition_ahead(text, i):
@@ -507,6 +543,18 @@ def type_text(text: str, profile: TypingProfile,
             _type_char(ch)
             chars_typed += 1
             consecutive_errors = 0
+            
+            # --- Auto-list defeat (Google Docs / Word bypass) ---
+            # If we just typed a space after a list marker (e.g. "1.", "-") at start of line
+            if ch == ' ' and profile.docs_autolist_guard and (i - word_start) > 0:
+                marker = text[word_start:i]
+                if AUTO_LIST_MARKER_RE.match(marker):
+                    if word_start == 0 or text[word_start - 1] == '\n':
+                        time.sleep(0.15)  # Let editor JS format it
+                        pyautogui.press('backspace') # Undo auto-format
+                        time.sleep(0.05)
+                        pyautogui.press('space')     # Re-type plain space
+            
             i += 1
 
         # --- Inter-keystroke delay ---
@@ -535,10 +583,8 @@ def type_text(text: str, profile: TypingProfile,
             time.sleep(random.uniform(*profile.pause_after_paragraph))
 
         # --- Long word pause (after finishing) ---
-        if ch == ' ' and i >= 2:
-            prev_word = _find_current_word(text, i - 2)
-            if len(prev_word) >= profile.long_word_threshold:
-                time.sleep(random.uniform(*profile.pause_after_long_word))
+        if ch == ' ' and prev_word_len >= profile.long_word_threshold:
+            time.sleep(random.uniform(*profile.pause_after_long_word))
 
         # --- Random thinking ---
         if random.random() < profile.thinking_probability:
@@ -554,8 +600,8 @@ def type_text(text: str, profile: TypingProfile,
             last_save_pause = chars_typed
 
         # --- Progress callback ---
-        if on_progress and chars_typed % 20 == 0:
-            on_progress(i, total_chars, time.time() - start_time)
+        if on_progress and (chars_typed % 3 == 0 or i == total_chars - 1):
+            on_progress(i + 1, total_chars, time.time() - start_time)
 
     elapsed = time.time() - start_time
     if on_progress:

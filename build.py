@@ -15,6 +15,8 @@ def main():
         "--onefile",
         "--windowed",
         "--name", "Typeflow",
+        "--icon", "icon.ico",
+        "--add-data", "icon.ico;.",
         "--add-data", "typeflow_engine.py;.",
         "--add-data", "ai_cleanup.py;.",
         "--hidden-import", "customtkinter",

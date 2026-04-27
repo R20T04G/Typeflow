@@ -9,6 +9,7 @@ import os
 import sys
 import threading
 import tkinter as tk
+import time
 from tkinter import filedialog
 
 import customtkinter as ctk
@@ -82,11 +83,24 @@ class TypeflowApp(ctk.CTk):
         self.minsize(800, 560)
         self.configure(fg_color=BG)
 
+        try:
+            self.iconbitmap(os.path.join(_base, "icon.ico"))
+        except Exception:
+            pass
+
         self._stop_flag = False
         self._pause_flag = False
         self._is_running = False
         self._cursor_index = 0
-        self._corner_pause_latched = False
+        self._cursor_tag = "typing_cursor"
+        self._cursor_fps_limit = 30.0
+        self._last_cursor_draw = 0.0
+        self._active_profile = None
+        self._text_changed_during_run = False
+        self._text_change_pause_latched = False
+        self._resume_delay_seconds = 5
+        self._resume_deadline = 0.0
+        self._resume_last_second = None
         self._suppress = False
         self._auto_mode = True
         self._default_est = 0.0
@@ -96,6 +110,7 @@ class TypeflowApp(ctk.CTk):
         self._refresh_timer = None  # debounce timer id
 
         self._build()
+        self.after(500, self._show_tutorial)
 
     # ==================================================================
     # BUILD UI
@@ -109,7 +124,7 @@ class TypeflowApp(ctk.CTk):
                      text_color=ACCENT).pack(side="left", padx=16)
         ctk.CTkLabel(top, text="Human-like typing simulator",
                      font=(FONT, 11), text_color=DIM).pack(side="left")
-        ctk.CTkLabel(top, text="Top-right corner = PAUSE   |   Top-left corner = ABORT",
+        ctk.CTkLabel(top, text="Use Pause/Stop buttons while typing",
                  font=(FONT, 10), text_color=DIM).pack(side="right", padx=16)
 
         # --- Body: two columns ---
@@ -143,7 +158,11 @@ class TypeflowApp(ctk.CTk):
                                        border_width=1, border_color=BORDER,
                                        wrap="word")
         self.text_box.pack(fill="both", expand=True, padx=14, pady=(4, 6))
+        tk_text = getattr(self.text_box, "_textbox", self.text_box)
+        tk_text.configure(insertwidth=0)
+        tk_text.tag_configure(self._cursor_tag, background=YELLOW, foreground="#000000")
         self.text_box.bind("<KeyRelease>", self._on_text_key_release)
+        self.text_box.bind("<KeyPress>", self._on_text_key_press)
         self.text_box.bind("<ButtonRelease-1>", self._on_cursor_moved)
         self.text_box.bind("<ButtonRelease-3>", self._on_cursor_moved)
 
@@ -244,9 +263,8 @@ class TypeflowApp(ctk.CTk):
         self.speed_var = tk.DoubleVar(value=1.0)
         self._slider(self.adv_frame, "Speed Multiplier", self.speed_var,
                      0.3, 3.0, "x", 0.1)
-        self.wpm_var = tk.DoubleVar(value=48.0)
-        self._slider(self.adv_frame, "Base WPM", self.wpm_var, 20, 120, "wpm", 2)
-        self.error_var = tk.DoubleVar(value=1.4)
+        self.wpm_var = tk.DoubleVar(value=55.0)
+        self.error_var = tk.DoubleVar(value=2.0)
         self._slider(self.adv_frame, "Typo Rate", self.error_var, 0, 8, "%", 0.1)
         self.think_var = tk.DoubleVar(value=0.6)
         self._slider(self.adv_frame, "Thinking Pauses", self.think_var,
@@ -316,6 +334,7 @@ class TypeflowApp(ctk.CTk):
                                            fg_color=INPUT, progress_color=ACCENT)
         self.progress.pack(fill="x")
         self.progress.set(0)
+        self._sync_visual_cursor()
 
     # ==================================================================
     # SLIDER FACTORY
@@ -394,7 +413,8 @@ class TypeflowApp(ctk.CTk):
                 content = load_text_file(path)
                 self.text_box.delete("1.0", "end")
                 self.text_box.insert("1.0", content)
-                self._update_cursor_index()
+                self._tk_text().mark_set("insert", "1.0")
+                self._set_cursor_index(0, see=True, force=True)
                 self._refresh()
             except Exception as e:
                 self.status.configure(
@@ -406,30 +426,64 @@ class TypeflowApp(ctk.CTk):
             if c:
                 self.text_box.delete("1.0", "end")
                 self.text_box.insert("1.0", c)
-                self._update_cursor_index()
+                self._tk_text().mark_set("insert", "1.0")
+                self._set_cursor_index(0, see=True, force=True)
                 self._refresh()
         except tk.TclError:
             pass
 
     def _clear(self):
         self.text_box.delete("1.0", "end")
-        self._update_cursor_index()
+        self._tk_text().mark_set("insert", "1.0")
+        self._set_cursor_index(0, force=True)
         self.ai_bar.pack_forget()
         self._refresh()
 
     def _txt(self) -> str:
         return self.text_box.get("1.0", "end-1c")
 
+    def _tk_text(self):
+        return getattr(self.text_box, "_textbox", self.text_box)
+
+    def _sync_visual_cursor(self, see=False):
+        tk_text = self._tk_text()
+        text = self._txt()
+        tk_text.tag_remove(self._cursor_tag, "1.0", "end")
+        if not text:
+            return
+
+        max_index = len(text) - 1
+        self._cursor_index = max(0, min(self._cursor_index, max_index))
+        start = f"1.0 + {self._cursor_index} chars"
+        end = f"{start} + 1 chars"
+        tk_text.tag_add(self._cursor_tag, start, end)
+        if see:
+            tk_text.see(start)
+
+    def _set_cursor_index(self, index, see=False, force=False):
+        self._cursor_index = max(0, int(index))
+        now = time.perf_counter()
+        if not force and (now - self._last_cursor_draw) < (1.0 / self._cursor_fps_limit):
+            return
+        self._sync_visual_cursor(see=see)
+        self._last_cursor_draw = now
+
+    def _on_text_key_press(self, _event=None):
+        if self._is_running:
+            return "break"
+
     def _on_text_key_release(self, _event=None):
         self._update_cursor_index()
+        self._sync_visual_cursor(see=True)
         self._debounced_refresh()
 
     def _on_cursor_moved(self, _event=None):
         self._update_cursor_index()
+        self._sync_visual_cursor(see=True)
 
     def _update_cursor_index(self):
         try:
-            self._cursor_index = int(self.text_box.count("1.0", "insert", "chars")[0])
+            self._cursor_index = len(self._tk_text().get("1.0", "insert"))
         except tk.TclError:
             self._cursor_index = 0
 
@@ -463,7 +517,7 @@ class TypeflowApp(ctk.CTk):
         cleaned = ai_clean(text, selected_names=None)
         self.text_box.delete("1.0", "end")
         self.text_box.insert("1.0", cleaned)
-        self._update_cursor_index()
+        self._set_cursor_index(0, see=True, force=True)
         self.ai_bar.pack_forget()
         self._refresh()
         self.status.configure(text="AI artifacts cleaned", text_color=GREEN)
@@ -574,6 +628,7 @@ class TypeflowApp(ctk.CTk):
             self.stat_est.configure(text="--")
             self.desired_label.configure(text="--")
             self.time_warn.configure(text="")
+            self._sync_visual_cursor()
             return
 
         chars = len(text)
@@ -603,6 +658,7 @@ class TypeflowApp(ctk.CTk):
 
         # Check for AI artifacts
         self._check_ai()
+        self._sync_visual_cursor()
 
     # ==================================================================
     # START / STOP
@@ -620,10 +676,13 @@ class TypeflowApp(ctk.CTk):
         self._is_running = True
         self._stop_flag = False
         self._pause_flag = False
-        self._corner_pause_latched = False
+        self._text_change_pause_latched = False
+        self._active_text_snapshot = text
+        self._last_text_check = 0.0
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.pause_btn.configure(state="normal", text="Pause")
+        self.focus_set()
         self.progress.set(0)
         profile = self._profile()
         self._typing_thread = threading.Thread(
@@ -634,7 +693,24 @@ class TypeflowApp(ctk.CTk):
 
 
     def _toggle_pause(self):
-        self._set_pause_state(not self._pause_flag)
+        if self._pause_flag:
+            self.pause_btn.configure(state="disabled")
+            threading.Thread(target=self._resume_countdown, daemon=True).start()
+        else:
+            self._set_pause_state(True)
+
+    def _resume_countdown(self):
+        import time as _t
+        cd = int(self.cd_var.get())
+        for i in range(cd, 0, -1):
+            if self._stop_flag:
+                return
+            self.after(0, lambda s=i: self.status.configure(
+                text=f"Resuming in {s}... Switch to your document!",
+                text_color=YELLOW))
+            _t.sleep(1)
+        self.after(0, lambda: self._set_pause_state(False))
+        self.after(0, lambda: self.pause_btn.configure(state="normal"))
 
     def _set_pause_state(self, paused, reason=None):
         self._pause_flag = paused
@@ -647,13 +723,14 @@ class TypeflowApp(ctk.CTk):
                 msg = f"Paused ({reason})"
             self.status.configure(text=msg, text_color=YELLOW)
         else:
+            self._text_change_pause_latched = False
             self.status.configure(text="Typing...", text_color=GREEN)
 
     def _reset_params(self):
         self._suppress = True
         self.speed_var.set(1.0)
-        self.wpm_var.set(48.0)
-        self.error_var.set(1.4)
+        self.wpm_var.set(55.0)
+        self.error_var.set(2.0)
         self.think_var.set(0.6)
         self.distract_var.set(0.08)
         self.save_var.set(300)
@@ -673,7 +750,6 @@ class TypeflowApp(ctk.CTk):
 
     def _run(self, text, start_index, profile, cd):
         import time as _t
-        import pyautogui
 
         for i in range(cd, 0, -1):
             if self._stop_flag:
@@ -691,39 +767,29 @@ class TypeflowApp(ctk.CTk):
             if total > 0:
                 self.after(0, lambda p=done/total, e=el: [
                     self.progress.set(p),
-                    self.elapsed.configure(text=format_duration(e))])
+                    self.elapsed.configure(text=format_duration(e)),
+                    self._set_cursor_index(done, see=True)])
 
         def check_pause_logic():
-            x, y = pyautogui.position()
-            w, _h = pyautogui.size()
-            corner_margin = 6
-
-            # Top-left corner always aborts.
-            if x <= corner_margin and y <= corner_margin:
-                self._stop_flag = True
-
-            # Top-right corner forces pause.
-            in_pause_corner = (x >= w - corner_margin and y <= corner_margin)
-            if in_pause_corner and not self._corner_pause_latched:
-                self._corner_pause_latched = True
-                if not self._pause_flag:
-                    self.after(0, lambda: self._set_pause_state(True, "top-right corner"))
-            else:
-                if not in_pause_corner:
-                    self._corner_pause_latched = False
+            now = time.perf_counter()
+            if (now - self._last_text_check) >= 0.1:
+                self._last_text_check = now
+                current_text = self._txt()
+                if current_text != self._active_text_snapshot:
+                    self._active_text_snapshot = current_text
+                    if not self._pause_flag and not self._text_change_pause_latched:
+                        self._text_change_pause_latched = True
+                        self.after(0, lambda: self._set_pause_state(True, "text box changed"))
 
             return self._pause_flag
-
-        def get_resume_index():
-            return max(0, min(self._cursor_index, len(text)))
 
         try:
             chars, el = type_text(text, profile,
                                   on_progress=prog,
                                   should_stop=lambda: self._stop_flag,
                                   check_pause=check_pause_logic,
-                                  get_resume_index=get_resume_index,
-                                  start_index=start_index)
+                                  start_index=start_index,
+                                  get_live_profile=self._profile)
         except Exception as e:
             self._done(f"Stopped: {type(e).__name__}")
             return
@@ -735,14 +801,36 @@ class TypeflowApp(ctk.CTk):
 
     def _done(self, msg):
         self._pause_flag = False
-        self._corner_pause_latched = False
+        self._text_change_pause_latched = False
         self._is_running = False
         self.after(0, lambda: [
             self.start_btn.configure(state="normal"),
             self.stop_btn.configure(state="disabled"),
             self.pause_btn.configure(state="disabled", text="Pause"),
             self.status.configure(text=msg, text_color=TEXT),
-            self.progress.set(1.0 if "Done" in msg else self.progress.get())])
+            self.progress.set(1.0 if "Done" in msg else self.progress.get()),
+            self._sync_visual_cursor()])
+
+    def _show_tutorial(self):
+        tut = ctk.CTkToplevel(self)
+        tut.title("Welcome to Typeflow")
+        tut.geometry("380x250")
+        tut.transient(self)
+        tut.grab_set()
+
+        f = ctk.CTkFrame(tut, fg_color=CARD, corner_radius=12, border_width=1, border_color=ACCENT)
+        f.pack(fill="both", expand=True, padx=12, pady=12)
+
+        ctk.CTkLabel(f, text="⚡ Quick Start Guide", font=(FONT, 15, "bold"), text_color=ACCENT).pack(pady=(12, 8))
+
+        msg = ("1. Paste your text or load a file.\n"
+               "2. Use the slider to set your Desired Time.\n"
+               "3. Click 'Start Typing' and click into your document.\n\n"
+               "To abort typing instantly, move your mouse cursor to the TOP-LEFT CORNER of your screen.")
+
+        ctk.CTkLabel(f, text=msg, font=(FONT, 12), text_color=TEXT, justify="left", wraplength=320).pack(pady=10, padx=14)
+
+        ctk.CTkButton(f, text="Got it!", command=tut.destroy, fg_color=GREEN, hover_color=ACCENT_H, width=120, font=(FONT, 12, "bold")).pack(pady=(10, 15))
 
 
 if __name__ == "__main__":
